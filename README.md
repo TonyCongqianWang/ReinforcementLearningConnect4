@@ -1,0 +1,3 @@
+# Connect Four
+
+In this repository I store my kaggle notebooks used to train an AI to play connect 4 with reinforcment learning. For the training I am using Stable Baselines 3. In particular, I use its PPO implementation to create and learn a model. In another notebook I evaluate models against each other and against a connect four solver that is capable to play perfectly. Lastly I implemented a Alpha Zero inspired monte carlo tree search (MCTS) that improves the playing strength of the raw model. To further improve the model, I could implement a more sophisticated training process that uses MCTS and the generated information to directly update the networks. 
