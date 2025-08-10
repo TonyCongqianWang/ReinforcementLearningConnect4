@@ -210,4 +210,6 @@ __marimo__/
 best_models/
 checkpoints/
 data/
-
+**/.DS_Store
+*.book
+connect4_solver_fork

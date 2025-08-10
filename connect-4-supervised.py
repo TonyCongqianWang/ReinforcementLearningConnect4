@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[2]:
+# In[1]:
 
 
 import math
@@ -13,9 +13,11 @@ from torch.utils.data import TensorDataset, DataLoader
 import os
 from transformers import get_cosine_schedule_with_warmup
 import itertools
+from collections import defaultdict
 
+os.makedirs('checkpoints', exist_ok=True)
 
-# In[3]:
+# In[2]:
 
 
 def argmax_accuracy(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -83,7 +85,7 @@ def argmax_accuracy(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return correct_count_original, correct_count_clipped
 
 
-# In[4]:
+# In[3]:
 
 
 class LayerNorm2d(nn.LayerNorm):
@@ -223,7 +225,7 @@ class ConnectFourBlock(nn.Module):
         return out 
 
 
-# In[5]:
+# In[4]:
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
@@ -303,7 +305,7 @@ class VisionTransformerWithTasks(nn.Module):
         return logits
 
 
-# In[6]:
+# In[5]:
 
 
 class PolicyHead(nn.Module):
@@ -426,7 +428,7 @@ class ValueHead(nn.Module):
         
         permuted_for_conv = out.permute(0, 3, 2, 1).contiguous()
         
-         # Shape: (B, W_orig, 1, C2)
+        # Shape: (B, W_orig, 1, C2)
         convolved_output = self.conv_permuted_input_width_as_channels(permuted_for_conv)
         flattened_output = convolved_output.view(B, -1) 
         silu_output = self.silu_flattened_output(flattened_output)
@@ -435,7 +437,7 @@ class ValueHead(nn.Module):
         return scalar_value
 
 
-# In[7]:
+# In[6]:
 
 
 input_channels = 2
@@ -557,7 +559,7 @@ def count_model_flops(model=None):
     print("Dummy Output:", dummy_output)
 
 
-# In[8]:
+# In[7]:
 
 
 from tqdm import tqdm
@@ -568,11 +570,43 @@ def move_to_device(batch, device):
         targets = targets.to(device, torch.float32)
         return obs, targets
 
-def validate_model(model, val_loader, device, max_batches = None, use_tqdm=False):
+mse_loss = nn.MSELoss(reduction='none')
+kl_criterion = nn.KLDivLoss(reduction='none', log_target=True)
+
+def calculate_loss(policy_outputs, value_outputs, next_value_outputs, labels):
+    target_policy_log_probs = F.log_softmax(labels / 10, dim=-1)
+    policy_log_probs = F.log_softmax(policy_outputs / 4, dim=-1)
+
+    _, best_choice_indices = torch.max(torch.clamp(labels, min=-1, max=1), dim=-1)
+    bad_choice_mask = torch.ones_like(policy_log_probs, dtype=torch.float)
+    bad_choice_mask.scatter_(1, best_choice_indices.unsqueeze(1), 0)
+    bad_choice_loss = - (policy_log_probs * bad_choice_mask).mean(dim=-1)
+
+    policy_loss = kl_criterion(policy_log_probs, target_policy_log_probs).sum(dim=1)
+    policy_loss = 0.8 * policy_loss + 0.002 * bad_choice_loss
+    
+    value_loss = mse_loss(value_outputs, torch.max(labels, dim=-1).values.unsqueeze(1)).mean(dim=1)
+    next_value_loss = mse_loss(next_value_outputs, labels).mean(dim=1)
+
+    combined_loss = 10000 * policy_loss + value_loss + 0.1 * next_value_loss
+
+    loss_parts = {
+        'combined': combined_loss,
+        'policy': policy_loss,
+        'value': value_loss,
+        'next_value': next_value_loss
+    }
+
+    return combined_loss, loss_parts
+
+def validate_model(model, val_loader, device, max_batches=None, use_tqdm=False, mine_hard=False):
     model.to(device)
     
-    mse_loss = nn.MSELoss()
-    kl_criterion = nn.KLDivLoss(reduction='batchmean', log_target=True)
+    if mine_hard:
+        hard_examples = []
+        
+    ema_loss = 0.0
+    ema_alpha = 0.05
     
     # Validation loop
     model.eval()
@@ -586,16 +620,9 @@ def validate_model(model, val_loader, device, max_batches = None, use_tqdm=False
     with torch.no_grad():
         for batch in loader_slice:
             inputs, labels = move_to_device(batch, device)
-            target_policy_log_probs = F.log_softmax(labels / 10, dim=-1)
-            
             policy_outputs, value_outputs, next_value_outputs = model(inputs)
-            policy_outputs = F.log_softmax(policy_outputs / 4, dim=-1)
 
-            kl_loss = kl_criterion(policy_outputs, target_policy_log_probs)
-            value_loss = mse_loss(value_outputs, torch.max(labels, dim=-1).values.unsqueeze(1))
-            next_value_loss = mse_loss(next_value_outputs, labels)
-                
-            loss = 10000 * kl_loss + value_loss + 0.1 * next_value_loss
+            loss, loss_parts = calculate_loss(policy_outputs, value_outputs, next_value_outputs, labels)
             
             batch_correct_count_strong, batch_correct_count_weak = argmax_accuracy(policy_outputs, labels)
             val_correct_count_strong += batch_correct_count_strong
@@ -605,11 +632,29 @@ def validate_model(model, val_loader, device, max_batches = None, use_tqdm=False
             val_correct_count_strong_nv += batch_correct_count_strong_nv
             val_correct_count_weak_nv += batch_correct_count_weak_nv
             
-            kl_loss_total += kl_loss.item() * inputs.size(0)
-            value_loss_total += value_loss.item() * inputs.size(0)
-            next_value_loss_total += next_value_loss.item() * inputs.size(0)
-            val_loss += loss.item() * inputs.size(0)
-            num_samples_in_val += inputs.size(0)
+            num_samples_in_batch = inputs.size(0)
+            batch_loss_mean = loss.mean(dim=0).item()
+            val_loss += batch_loss_mean * num_samples_in_batch
+            kl_loss_total += loss_parts["policy"].sum(dim=0).item()
+            value_loss_total += loss_parts["value"].sum(dim=0).item()
+            next_value_loss_total += loss_parts["next_value"].sum(dim=0).item()
+            num_samples_in_val += num_samples_in_batch
+            
+            if mine_hard:
+                # Update the exponential moving average (EMA) of the loss
+                if ema_loss == 0.0:
+                    ema_loss = 0.8 * batch_loss_mean
+                else:
+                    ema_loss = ema_alpha * batch_loss_mean + (1 - ema_alpha) * ema_loss
+                
+                threshold = ema_loss * 10
+                hard_example_indices = torch.where(loss > threshold)[0]
+                
+                if len(hard_example_indices) > 0:
+                    hard_inputs = inputs[hard_example_indices]
+                    hard_labels = labels[hard_example_indices]
+                    hard_losses = loss[hard_example_indices]
+                    hard_examples.append((hard_inputs, hard_labels, hard_losses))
             
     epoch_val_loss = {
             "combined": val_loss / num_samples_in_val, "policy": kl_loss_total / num_samples_in_val,
@@ -622,6 +667,15 @@ def validate_model(model, val_loader, device, max_batches = None, use_tqdm=False
 
     print(f"Validation Loss: {epoch_val_loss}")
     print(f"Validation Policy Acc: {epoch_val_policy_acc}")
+    if mine_hard:
+        if len(hard_examples) > 0:
+            hard_inputs_tensor = torch.cat([ex[0] for ex in hard_examples], dim=0)
+            hard_labels_tensor = torch.cat([ex[1] for ex in hard_examples], dim=0)
+            hard_losses_tensor = torch.cat([ex[2] for ex in hard_examples], dim=0)
+            return hard_inputs_tensor, hard_labels_tensor, hard_losses_tensor
+        else:
+            return None
+            
     return epoch_val_policy_acc
 
 def train_model(
@@ -644,9 +698,6 @@ def train_model(
     
     total_steps = num_batches_per_epoch * epochs
     
-    mse_loss = nn.MSELoss()
-    kl_criterion = nn.KLDivLoss(reduction='batchmean', log_target=True)
-    
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     scheduler = get_cosine_schedule_with_warmup(optimizer, math.ceil(total_steps * warmup_fraction), total_steps)
@@ -668,8 +719,8 @@ def train_model(
             step += 1
             if step >= num_batches_per_epoch:
                 step = 0
-                epoch_train_loss = running_loss / num_samples_in_epoch
-                print(f"Epoch [{epoch}/{epochs}] done, Training Loss: {epoch_train_loss:.4f}")
+                running_loss_avg = {loss_name: loss_value / num_samples_in_epoch for loss_name, loss_value in running_loss.items()}
+                print(f"Epoch [{epoch}/{epochs}] done, Training Loss: {running_loss_avg}")
                 
                 epoch_val_policy_acc = validate_model(model, val_loader, device, num_batches_per_epoch, use_tqdm=use_tqdm)
                 # Save checkpoint and best model based on validation accuracy
@@ -681,7 +732,7 @@ def train_model(
                 
             if step == 0:
                 epoch += 1
-                running_loss = 0.0
+                running_loss = defaultdict(float)
                 num_samples_in_epoch = 0
                 if epoch >= epochs:
                     continue_training = False
@@ -689,50 +740,34 @@ def train_model(
                 print(f"Begin epoch {epoch} with LR: {optimizer.param_groups[0]['lr']:.6f}")
                 
             inputs, labels = move_to_device(batch, device)
-            target_policy_log_probs = F.log_softmax(labels / 10, dim=-1)
-            
+
             optimizer.zero_grad()
-            
+
             policy_outputs, value_outputs, next_value_outputs = model(inputs)
-            policy_outputs = F.log_softmax(policy_outputs / 4, dim=-1)
 
-            kl_loss = 10000 * kl_criterion(policy_outputs, target_policy_log_probs)
-            value_loss = mse_loss(value_outputs, torch.max(labels, dim=-1).values.unsqueeze(1))
-            next_value_loss = 0.1 * mse_loss(next_value_outputs, labels)
-            
-            loss = kl_loss + value_loss + next_value_loss
+            combined_loss, loss_parts = calculate_loss(policy_outputs, value_outputs, next_value_outputs, labels)
 
-            loss.backward()
+            combined_loss.mean(dim=0).backward()
             optimizer.step()
             scheduler.step()
-            batch_train_loss = loss.item()
+
             num_samples_in_epoch += inputs.size(0)
-            running_loss += batch_train_loss * inputs.size(0)
+            for loss_name, loss_value in loss_parts.items():
+                running_loss[loss_name] += loss_value.sum(dim=0).item()
             if (step + 1) % math.ceil(num_batches_per_epoch / 10) == 0:
-                running_loss_avg = running_loss / num_samples_in_epoch
-                print(f"Epoch [{epoch}/{epochs}], Step [{step} / {num_batches_per_epoch}], Running Loss: {running_loss_avg} Batch Loss: {kl_loss.item():.4f} + {value_loss.item():.4f} + {next_value_loss.item():.4f} = {batch_train_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+                running_loss_avg = {loss_name: loss_value / num_samples_in_epoch for loss_name, loss_value in running_loss.items()}
+                print(f"Epoch [{epoch}/{epochs}], Step [{step} / {num_batches_per_epoch}], Running Loss: {running_loss_avg}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
 
     print("Finished Training")
     print(f"Best validation acc achieved: {best_val_acc:.4f}")
 
 
-# In[9]:
+# In[8]:
 
 
-def adjust_targets(targets_np):
-        mask_pos = targets_np > 0
-        targets_np[mask_pos] += 100
-        mask_neg = targets_np < 0
-        targets_np[mask_neg] -= 100
-
-
-# In[10]:
-
-
-def load_dataset(dataset_path, seed=12505):
+def load_dataset(dataset_path):
     import numpy as np
-    from sklearn.model_selection import train_test_split
     import gc
     import torch
 
@@ -740,19 +775,11 @@ def load_dataset(dataset_path, seed=12505):
         print("Loading dataset with mmap_mode='r'...")
 
         dataset = np.load(dataset_path, mmap_mode='r')
-        full_train_obs = dataset["x_train"]
-        full_train_targets = dataset["y_train"]
+        train_obs_np = dataset["x_train"]
+        train_targets_np = dataset["y_train"]
+        val_obs_np = dataset["x_val"]
+        val_targets_np = dataset["y_val"]
 
-        print("Creating train/validation splits...")
-        train_obs_np, val_obs_np, train_targets_np, val_targets_np = train_test_split(
-            full_train_obs, full_train_targets, test_size=0.1, random_state=seed
-        )
-
-        adjust_targets(train_targets_np)
-        adjust_targets(val_targets_np)
-
-        del full_train_obs
-        del full_train_targets
         del dataset
         gc.collect() # Force garbage collection
 
@@ -787,7 +814,7 @@ def load_dataset(dataset_path, seed=12505):
         return None
 
 
-# In[11]:
+# In[9]:
 
 
 import torch
@@ -804,22 +831,32 @@ def load_weights_only(filepath):
     """
     try:
         # Load the entire checkpoint
-        checkpoint = torch.load(filepath)
+        checkpoint = torch.load(filepath, map_location="cpu")
 
         # Check if the loaded object is a state_dict directly
         if isinstance(checkpoint, dict) and all(isinstance(k, str) for k in checkpoint.keys()):
             # Assume it's a state_dict if all keys are strings (common for weights)
             print(f"Successfully loaded state_dict from {filepath}")
-            return checkpoint
+            state_dict = checkpoint
         elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             # If it's a dictionary containing a 'state_dict' key (common for full checkpoints)
             print(f"Successfully loaded 'state_dict' from checkpoint in {filepath}")
-            return checkpoint['state_dict']
+            state_dict = checkpoint['state_dict']
         else:
             print(f"Warning: The .pth file at {filepath} does not seem to contain a standard state_dict or a checkpoint with 'state_dict'.")
             print("Attempting to return the loaded object directly. Please inspect its content.")
-            return checkpoint # Return whatever was loaded, might be a raw tensor or other data
+            state_dict = checkpoint
 
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                # Remove the prefix and add the key-value pair to the new dict
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                # Keep keys that don't have the prefix as they are
+                new_state_dict[key] = value
+        return new_state_dict
     except FileNotFoundError:
         print(f"Error: File not found at {filepath}")
         return None
@@ -828,36 +865,37 @@ def load_weights_only(filepath):
         return None
 
 
-# In[12]:
+# In[10]:
 
+import sys
 
-arch = "vit_medium"
-num_run = 0
+arch = sys.argv[1]
+num_run = sys.argv[2]
 
 model = get_custom_model(arch)
 count_model_flops(model)
 
 
-# In[13]:
+# In[11]:
 
 
-dataset_path = "./c4_data.npz"
+dataset_path = "./data/c4_data_enriched.npz"
 
 
-# In[14]:
+# In[12]:
 
 
-dataset_splits = load_dataset(dataset_path, seed=12505)
+dataset_splits = load_dataset(dataset_path)
 if dataset_splits is None:
     os._exit(1)
 
 train_dataset, val_dataset = dataset_splits
 
 
-# In[15]:
+# In[13]:
 
 
-save_model_name = f"{arch}_r{num_run}"
+save_model_name = f"checkpoints/{arch}_r{num_run}"
 checkpoint_file = f"{save_model_name}_checkpoint.pth"
 best_model_file = f"{save_model_name}_best_model.pth"
 
@@ -867,44 +905,74 @@ weights = load_weights_only(load_file)
 if weights:
     print("Keys in loaded weights:", weights.keys())
     try:
-        model.load_state_dict(weights, strict=False)
+        model.load_state_dict(weights)
         print("Successfully loaded weights into a new model.")
     except Exception as e:
         print(f"Could not load weights into a new model: {e}")
 
 
-# In[ ]:
+# In[14]:
 
+torch.set_float32_matmul_precision("high")
+device = torch.device("cuda")
+model = torch.compile(model)
 
-device = torch.device("mps")
 args = dict(
     train_dataset=train_dataset,
     val_dataset=val_dataset,
     model=model,
     batch_size=2 ** 11,
-    learning_rate=5e-5,
-    epochs=200,
+    learning_rate=8e-6,
+    epochs=60,
     num_batches_per_epoch=4000,
     warmup_fraction=0.2,
-    weight_decay=0.008,
+    weight_decay=4e-5,
     checkpoint_path=checkpoint_file,
     best_model_path=best_model_file,
     device=device,
     use_tqdm=True
 )
 
+
+# In[15]:
+
+
 train_model(**args)
-del train_dataset
-del val_dataset
+
+
+# In[16]:
+
+
+# Mine hard examples
+if False:
+    model.to(device)
+    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True)
+    hard_examples = validate_model(model, train_loader, device, max_batches=100, use_tqdm=True, mine_hard=True)
+    if hard_examples:
+        print(len(hard_examples[0]))
+        hard_inputs, hard_targets, hard_losses = hard_examples
+        hard_examples_tensor = {
+            "obs": hard_inputs.cpu(),
+            "targets": hard_targets.cpu(),
+            "loss": hard_losses.cpu()
+        }
+
+        torch.save(hard_examples_tensor, "hard_examples.pt")
 
 
 # In[17]:
 
 
+del train_dataset
+del val_dataset
+
+
+# In[18]:
+
+
 dataset = np.load(dataset_path, mmap_mode='r')
 test_obs = torch.from_numpy(dataset["x_test"])
 test_targets = torch.from_numpy(dataset["y_test"])
-adjust_targets(test_targets)
 
 random_seed = 534984
 indices = np.arange(len(test_obs))
@@ -916,38 +984,29 @@ test_targets = test_targets[indices]
 test_dataset = TensorDataset(test_obs, test_targets)
 
 
-# In[ ]:
+# In[19]:
 
 
 model.to(device)
 test_loader = DataLoader(test_dataset, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True)
-validate_model(model, test_loader, device, max_batches=50000, use_tqdm=True)
+validate_model(model, test_loader, device, max_batches=None, use_tqdm=True)
 
 
-# In[19]:
+# In[20]:
 
 
 save_model = model
 save_model.to(torch.device("cpu"))
 save_model.eval()
 save_model(torch.randn((1, 2, 6, 7)))
-class ModelWrapper(nn.Module):
-    def __init__(self, base_model):
-        super().__init__()
-        self.base_model = base_model
 
-    def forward(self, obs):
-        policy, value, _ = self.base_model(obs)
-        return policy, value
-save_model_wrapped = ModelWrapper(save_model)
-
-save_model_wrapped.eval()
 example_inputs = (torch.randn(1, 2, 6, 7),)
-onnx_program = torch.onnx.export(save_model_wrapped, example_inputs, dynamo=True)
+onnx_program = torch.onnx.export(save_model, example_inputs, dynamo=True)
 onnx_program.save(f"{save_model_name}.onnx")
+print(f"Model saved to {save_model_name}.onnx")
 
 
-# In[20]:
+# In[21]:
 
 
 import onnx
@@ -970,8 +1029,8 @@ onnxruntime_outputs = ort_session.run(None, onnxruntime_input)
 onnxruntime_outputs
 
 
-# In[21]:
+# In[22]:
 
 
-save_model_wrapped(example_inputs[0])
+save_model(example_inputs[0])
 
